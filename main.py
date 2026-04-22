@@ -728,15 +728,18 @@ def transform_ajax_callbacks(content):
             err_args, body, _, _ = callbacks['error']
             params = [p.strip() for p in err_args.strip('()').split(',') if p.strip()]
             catch_param = params[0] if params else 'xhr'
-            # jQuery error callback: (jqXHR, textStatus, errorThrown)
-            # .catch() receives only jqXHR; derive the rest from it.
-            decls = []
-            if len(params) >= 2:
-                decls.append(f'var {params[1]} = {catch_param}.statusText;')
-            if len(params) >= 3:
-                decls.append(f'var {params[2]} = {catch_param}.statusText;')
-            if decls:
-                body = '{ ' + ' '.join(decls) + ' ' + body[1:]
+            for extra in params[1:]:
+                p = re.escape(extra)
+                # Remove: extra + "sep" + next
+                body = re.sub(r'\b' + p + r'\b\s*\+\s*["\'][^"\']*["\']\s*\+\s*', '', body)
+                # Remove: extra + next (no sep string)
+                body = re.sub(r'\b' + p + r'\b\s*\+\s*', '', body)
+                # Remove: prev + "sep" + extra
+                body = re.sub(r'\s*\+\s*["\'][^"\']*["\']\s*\+\s*\b' + p + r'\b', '', body)
+                # Remove: prev + extra (no sep string)
+                body = re.sub(r'\s*\+\s*\b' + p + r'\b', '', body)
+                # Standalone (fallback)
+                body = re.sub(r'\b' + p + r'\b', '', body)
             chain.append(f'.catch(function({catch_param}) {body})')
 
         result.append(f'$.ajax({new_opts})\n{indent}' + f'\n{indent}'.join(chain))
