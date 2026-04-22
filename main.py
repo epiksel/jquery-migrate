@@ -498,13 +498,32 @@ def transform_which(content):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Transform 13: $(sel).load(url)  →  $.get(url, fn)
+# Transform 13: $(sel).load(url)  →  $.get(url).then(fn)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _split_load_url(url_arg):
+    """Split a jQuery .load() URL string into (clean_url, fragment_selector).
+    jQuery treats 'url #sel' — text after the first space — as a CSS selector.
+    Returns (url_arg, None) when no embedded fragment is found or arg is not a string literal.
+    """
+    s = url_arg.strip()
+    if len(s) < 2 or s[0] not in ('"', "'") or s[-1] != s[0]:
+        return url_arg, None
+    inner = s[1:-1]
+    space_pos = inner.find(' ')
+    if space_pos == -1:
+        return url_arg, None
+    frag = inner[space_pos:].strip()
+    if not frag:
+        return url_arg, None
+    return f"{s[0]}{inner[:space_pos]}{s[0]}", frag
+
 
 def transform_load(content):
     """
-    $(sel).load(url)                →  $.get(url, function(data){ $(sel).html(data); })
-    $(sel).load(url, '#inner')      →  $.get(url, function(data){ $(sel).html($(data).find('#inner')); })
+    $(sel).load(url)              →  $.get(url).then(function(data) {\n    $(sel).html(data);\n})
+    $(sel).load('url #frag')      →  $.get('url').then(function(data) {\n    $(sel).html($(data).find('#frag'));\n})
+    $(sel).load(url, callbackRef) →  $.get(url).then(function(data) {\n    $(sel).html(data);\n    callbackRef(data);\n})
     """
     needle = '.load('
     result, i = [], 0
@@ -522,7 +541,6 @@ def transform_load(content):
             continue
 
         # Scan backwards from the ) before .load( to find the matching $(...).
-        # The rfind('(') approach incorrectly matched ( characters inside the selector.
         pre_pos = pos - 1
         while pre_pos >= 0 and content[pre_pos] in ' \t\n\r':
             pre_pos -= 1
@@ -554,27 +572,50 @@ def transform_load(content):
 
         if sel_expr is not None and url_args:
             url_expr = url_args[0]
+            url_clean, frag_sel = _split_load_url(url_expr)
 
-            if len(url_args) == 1:
-                # Simple: $(sel).load(url)
+            # Line indentation for multi-line output
+            sol = content.rfind('\n', 0, sel_abs_start)
+            sol = sol + 1 if sol != -1 else 0
+            indent = ''
+            k = sol
+            while k < sel_abs_start and content[k] in ' \t':
+                indent += content[k]
+                k += 1
+            step = '\t' if (indent and indent[0] == '\t') else '    '
+            body_indent = indent + step
+
+            css_sel = frag_sel  # may be None (from embedded URL fragment)
+            callback_ref = None
+            can_transform = True
+
+            if len(url_args) == 2:
+                second = url_args[1].strip()
+                if re.match(r'^[\'"]', second):
+                    # Quoted string → fragment selector as a separate argument
+                    m2 = re.match(r'^([\'"])(.*)\1$', second)
+                    css_sel = m2.group(2).strip() if m2 else None
+                    if css_sel is None:
+                        can_transform = False
+                elif re.match(r'^[\w$][\w$.\[\]]*$', second):
+                    # Simple identifier or dotted chain → callable reference
+                    callback_ref = second
+                else:
+                    can_transform = False
+            elif len(url_args) > 2:
+                can_transform = False
+
+            if can_transform:
+                html_arg = f"$(data).find('{css_sel}')" if css_sel else 'data'
                 result.append(content[i: sel_abs_start])
-                result.append(
-                    f"$.get({url_expr}, function(data) {{ {sel_expr}.html(data); }})"
-                )
+                lines = [f"$.get({url_clean}).then(function(data) {{"]
+                lines.append(f"{body_indent}{sel_expr}.html({html_arg});")
+                if callback_ref:
+                    lines.append(f"{body_indent}{callback_ref}(data);")
+                lines.append(f"{indent}}})")
+                result.append('\n'.join(lines))
                 i = end
                 continue
-
-            elif len(url_args) == 2:
-                # With fragment selector: $(sel).load(url, '#inner')
-                inner_sel_m = re.search(r"""['"]\s*([^'"]+)['"]""", url_args[1])
-                if inner_sel_m:
-                    css_sel = inner_sel_m.group(1).strip()
-                    result.append(content[i: sel_abs_start])
-                    result.append(
-                        f"$.get({url_expr}, function(data) {{ {sel_expr}.html($(data).find('{css_sel}')); }})"
-                    )
-                    i = end
-                    continue
 
         # Cannot transform — leave as is, add TODO
         result.append(content[i: pos])
@@ -765,7 +806,31 @@ def transform_get_callback(content):
 
         url_part = content[paren_pos+1:comma]
         cb_text = content[cb_start:paren_close].rstrip()
-        result.append(f'$.get({url_part}).then({cb_text})')
+
+        # Line indentation for multi-line formatting
+        ls = content.rfind('\n', 0, m.start())
+        ls = ls + 1 if ls != -1 else 0
+        indent = ''
+        k = ls
+        while k < m.start() and content[k] in ' \t':
+            indent += content[k]; k += 1
+        step = '\t' if (indent and indent[0] == '\t') else '    '
+
+        # Expand single-line inline function to multi-line
+        formatted = None
+        cb = cb_text.strip()
+        if '\n' not in cb:
+            fn_result = extract_fn(cb, 0)
+            if fn_result:
+                fn_args, fn_body, _ = fn_result
+                body_inner = fn_body[1:-1].strip()
+                formatted = (
+                    f'$.get({url_part}).then(function{fn_args} {{\n'
+                    f'{indent}{step}{body_inner}\n'
+                    f'{indent}}})'
+                )
+
+        result.append(formatted if formatted else f'$.get({url_part}).then({cb_text})')
         i = paren_close + 1
 
     return ''.join(result)
