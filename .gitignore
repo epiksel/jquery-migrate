@@ -1,0 +1,11 @@
+# IDE Project files
+/.idea/*
+/.DS_Store
+/.cache
+/.php-cs-fixer.cache
+/.claude
+/__pycache__
+
+# ENV
+.env
+.env.docker
